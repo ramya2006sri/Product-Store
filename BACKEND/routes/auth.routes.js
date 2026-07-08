@@ -1,6 +1,7 @@
 import express from "express";
 import passport from "../config/passport.js";
 import jwt from "jsonwebtoken";
+import sanitizeInput from "../middleware/sanitizeInput.js";
 
 import {
   registerUser,
@@ -13,7 +14,7 @@ import { loginLimiter, logoutLimiter, registerLimiter } from "../middleware/rate
 
 const router = express.Router();
 
-router.post("/register",registerLimiter, registerUser);
+router.post("/register",registerLimiter,sanitizeInput, registerUser);
 
 router.post("/login",loginLimiter, loginUser);
 
