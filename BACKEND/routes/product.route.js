@@ -1,5 +1,6 @@
 import express from "express";
 import upload, { handleUploadError } from "../middleware/upload.js";
+import sanitizeInput from "../middleware/sanitizeInput.js";
 import { createProduct, deleteProduct, getProducts, getProductCategories, updateProduct, getProductById, getRelatedProducts, searchProducts, getProductBundle } from "../controllers/product.controller.js";
 import reviewRoutes from './review.route.js';  // ← YEH LINE ADD KARO
 
@@ -11,8 +12,8 @@ router.get("/related/:id", getRelatedProducts);
 router.get("/search", searchProducts);
 router.get("/:id/bundle", getProductBundle);
 router.get("/:id", getProductById);
-router.post("/", upload.single("image"), handleUploadError, createProduct);
-router.put("/:id", upload.single("image"), handleUploadError, updateProduct);
+router.post("/", upload.single("image"), handleUploadError, sanitizeInput, createProduct);
+router.put("/:id", upload.single("image"), handleUploadError, sanitizeInput, updateProduct);
 router.delete("/:id", deleteProduct);
 
 
