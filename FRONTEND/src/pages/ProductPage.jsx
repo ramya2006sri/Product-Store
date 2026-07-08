@@ -1,31 +1,32 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { useParams, Link as RouterLink } from 'react-router-dom';
 import {
-  Box, Container, Flex, Image, Heading, Text, Button,
-  Spinner, Alert, AlertIcon, VStack, HStack, useColorModeValue,
-  useToast, Badge, Divider, Icon, Grid, GridItem, SimpleGrid, Checkbox
+  Box, Container, Flex, Grid, GridItem, SimpleGrid, Image, Icon, Heading, Text,
+  Button, Badge, Divider, Checkbox, Select, VStack, HStack, useToast, useColorModeValue,
 } from '@chakra-ui/react';
-import { FaArrowLeft, FaShoppingCart, FaCheckCircle, FaTruck, FaShieldAlt, FaUndo, FaInfoCircle, FaGift, FaChevronLeft, FaChevronRight } from 'react-icons/fa';
-import { useCart } from '../store/cart.js';
-import { useRecentlyViewed } from "../store/product";
+import {
+  FaArrowLeft, FaShoppingCart, FaCheckCircle, FaTruck, FaShieldAlt, FaUndo,
+  FaInfoCircle, FaGift, FaChevronLeft, FaChevronRight,
+} from 'react-icons/fa';
+import axios from 'axios';
+import { getSocket } from '../socket';
 import RelatedProducts from '../components/ui/RelatedProducts';
 import ProductReviews from '../components/ui/ProductReviews';
 
-const API = ( import.meta.env.VITE_API_URL || "" ).replace( /\/$/, "" );
-
 const ProductPage = () => {
   const { id } = useParams();
-  const [product, setProduct] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
+  const toast = useToast();
+  const [selectedSize, setSelectedSize] = useState('');
+  const [selectedColor, setSelectedColor] = useState('');
+  const [displayPrice, setDisplayPrice] = useState(0);
+  const [displayStock, setDisplayStock] = useState(0);
+  const [selectedVariantId, setSelectedVariantId] = useState(null);
+
+  // Catalog interaction state (was lost in a merge; restored here).
   const [quantity, setQuantity] = useState(1);
+  const [activeImg, setActiveImg] = useState(0);
   const [bundleData, setBundleData] = useState(null);
   const [selectedBundleItems, setSelectedBundleItems] = useState([]);
-  const [activeImg, setActiveImg] = useState(0);
-
-  const { addToCart, addBundleToCart } = useCart();
-  const { addRecentlyViewed } = useRecentlyViewed();
-  const toast = useToast();
 
   const textColor = useColorModeValue("gray.700", "gray.300");
   const priceColor = useColorModeValue("blue.600", "blue.300");
@@ -34,63 +35,67 @@ const ProductPage = () => {
   const featureBg = useColorModeValue("gray.50", "gray.700");
   const infoColor = useColorModeValue("gray.700", "gray.300");
 
-  const hasStock = product && product.stock !== undefined && product.stock !== null;
-  const isOutOfStock = hasStock && product.stock === 0;
-  const maxQty = hasStock && product.stock > 0 ? Math.min(product.stock, 10) : 10;
-
   useEffect(() => {
     const fetchProduct = async () => {
-      setLoading(true);
-      setError(null);
       try {
-        const url = `${API}/api/products/${id}`;
-        const res = await fetch(url);
-
-        if (!res.ok) {
-          if (res.status === 404) {
-            throw new Error("Product not found. It may have been deleted or the link is invalid.");
-          } else if (res.status === 500) {
-            throw new Error("Server error. Please try again later.");
-          } else {
-            throw new Error(`HTTP ${res.status}: Failed to fetch product`);
-          }
-        }
-
-        const data = await res.json();
-
-        if (data.success) {
-          setProduct(data.data);
-          setActiveImg(0);
-          addRecentlyViewed(data.data);
-        } else {
-          throw new Error(data.message || "Failed to fetch product details");
+        const { data } = await axios.get('/api/products/' + id);
+        setProduct(data);
+        if (!data.hasVariants) {
+          setDisplayPrice(data.basePrice);
+          setDisplayStock(data.baseStock);
         }
       } catch (err) {
-        setError(err.message);
-      } finally {
-        setLoading(false);
+        console.error(err);
+      }
+    };
+    fetchProduct();
+  }, [id]);
+
+  useEffect(() => {
+    if (product && product.hasVariants && selectedSize && selectedColor) {
+      const matched = product.variants.find(v => v.size === selectedSize && v.color === selectedColor);
+      if (matched) {
+        setDisplayPrice(matched.price);
+        setDisplayStock(matched.stock);
+        setSelectedVariantId(matched._id);
+      } else {
+        setDisplayStock(0);
+        setSelectedVariantId(null);
+      }
+    }
+  }, [selectedSize, selectedColor, product]);
+
+  useEffect(() => {
+    if (!product) return;
+    
+    const socket = getSocket();
+    const handleStockUpdate = (data) => {
+      if (data.productId === product._id) {
+        setProduct((prev) => ({ ...prev, baseStock: data.newStock }));
+        if (!product.hasVariants) {
+          setDisplayStock(data.newStock);
+        }
       }
     };
 
-    if (id) {
-      fetchProduct();
-    }
-  }, [id, addRecentlyViewed]);
+    socket.on("stockUpdate", handleStockUpdate);
 
+    return () => {
+      socket.off("stockUpdate", handleStockUpdate);
+    };
+  }, [product]);
+
+  // Load "Frequently Bought Together" data and pre-select every item.
   useEffect(() => {
     if (!id) return;
     const fetchBundle = async () => {
       try {
-        const res = await fetch(`${API}/api/products/${id}/bundle`);
-        if (!res.ok) {
-           console.error("Failed to fetch bundle, status:", res.status);
-           setBundleData(null);
-           return;
-        }
-        const data = await res.json();
+        const { data } = await axios.get('/api/products/' + id + '/bundle');
         if (data.success && data.data && data.data.items.length > 0) {
           setBundleData(data.data);
-          setSelectedBundleItems(data.data.items.map(i => i.product._id));
+          setSelectedBundleItems(data.data.items.map((i) => i.product._id));
+        } else {
+          setBundleData(null);
         }
       } catch (err) {
         console.error("Error fetching bundle:", err);
@@ -100,113 +105,63 @@ const ProductPage = () => {
     fetchBundle();
   }, [id]);
 
-  const handleAddToCart = () => {
-    if (!product || isOutOfStock) return;
-    const { status, added } = addToCart(product, quantity);
-    if (added === 0) {
-      toast({
-        title: "Stock limit reached",
-        description: `You already have the maximum available stock of ${product.name} in your cart.`,
-        status: "warning",
-        duration: 2500,
-        isClosable: true,
-        position: "top-right",
-      });
-      return;
-    }
-    if (status === 'capped') {
-      toast({
-        title: "Stock limit reached",
-        description: `Only ${added} item${added !== 1 ? 's were' : ' was'} added — you've reached the available stock for ${product.name}.`,
-        status: "warning",
-        duration: 2500,
-        isClosable: true,
-        position: "top-right",
-      });
-      return;
-    }
-    toast({
-      title: "Added to Cart",
-      description: `${added} x ${product.name} added to your cart.`,
-      status: "success",
-      duration: 2500,
-      isClosable: true,
-      position: "top-right",
-    });
-  };
-
-  const handleAddBundleToCart = () => {
-    const allItems = [product, ...bundleData.items
-      .filter(i => selectedBundleItems.includes(i.product._id))
-      .map(i => i.product)];
-    const { addedCount, skippedCount } = addBundleToCart(allItems);
-
-    if (addedCount > 0) {
-      toast({
-        title: "Bundle Added!",
-        description: `${addedCount} item${addedCount !== 1 ? 's' : ''} added to your cart.`,
-        status: "success",
-        duration: 2500,
-        isClosable: true,
-        position: "top-right",
-      });
-      return;
-    }
-
-    if (skippedCount > 0) {
-      toast({
-        title: "Stock limit reached",
-        description: `${skippedCount} item${skippedCount !== 1 ? 's' : ''} couldn't be added due to stock limits.`,
-        status: "warning",
-        duration: 3500,
-        isClosable: true,
-        position: "top-right",
-      });
+  const handleAddToCart = async () => {
+    try {
+      if (product.hasVariants && !selectedVariantId) {
+        toast({ title: 'Please select valid options', status: 'warning' });
+        return;
+      }
+      await axios.post('/api/cart', { productId: product._id, variantId: selectedVariantId, quantity });
+      toast({ title: 'Added to cart!', status: 'success' });
+    } catch {
+      toast({ title: 'Error adding to cart', status: 'error' });
     }
   };
 
   const toggleBundleItem = (productId) => {
-    setSelectedBundleItems(prev =>
+    setSelectedBundleItems((prev) =>
       prev.includes(productId)
-        ? prev.filter(id => id !== productId)
+        ? prev.filter((pid) => pid !== productId)
         : [...prev, productId]
     );
   };
 
-  if (loading) {
-    return (
-      <Flex minH="70vh" align="center" justify="center" direction="column" gap={4}>
-        <Spinner size="xl" color="blue.500" thickness="4px" speed="0.65s" />
-        <Text color={textColor} fontSize="lg">Loading product details...</Text>
-      </Flex>
-    );
-  }
+  const handleAddBundleToCart = async () => {
+    if (!bundleData) return;
+    const selected = [
+      product,
+      ...bundleData.items
+        .filter((i) => selectedBundleItems.includes(i.product._id))
+        .map((i) => i.product),
+    ];
+    try {
+      await Promise.all(
+        selected.map((p) => axios.post('/api/cart', { productId: p._id, quantity: 1 }))
+      );
+      toast({ title: `${selected.length} items added to cart!`, status: 'success' });
+    } catch {
+      toast({ title: 'Error adding bundle to cart', status: 'error' });
+    }
+  };
 
-  if (error || !product) {
-    return (
-      <Container maxW="container.md" py={20}>
-        <Alert status="error" borderRadius="lg" variant="left-accent" p={6}>
-          <AlertIcon boxSize={6} />
-          <VStack align="start" spacing={2}>
-            <Text fontWeight="bold" fontSize="lg">Error Loading Product</Text>
-            <Text fontSize="sm">{error || "Product not found or has been removed."}</Text>
-          </VStack>
-        </Alert>
-        <Button
-          as={RouterLink}
-          to="/"
-          mt={6}
-          colorScheme="blue"
-          leftIcon={<FaArrowLeft />}
-          size="lg"
-        >
-          Back to Products
-        </Button>
-      </Container>
-    );
-  }
+  // All product images, with a placeholder fallback so the gallery never breaks.
+  const allImages = useMemo(() => {
+    if (!product) return [];
+    const imgs = [
+      product.image,
+      ...(product.images || []),
+      ...(product.variants?.flatMap((v) => v.images || []) || []),
+    ].filter(Boolean);
+    return imgs.length
+      ? [...new Set(imgs)]
+      : ["https://via.placeholder.com/600x600?text=Product+Image"];
+  }, [product]);
 
-const allImages = [product?.image, ...(product?.images || [])].filter(Boolean);
+  if (!product) return <Box>Loading...</Box>;
+
+  const isOutOfStock = displayStock !== undefined && displayStock !== null && displayStock <= 0;
+  const maxQty = displayStock > 0 ? Math.min(displayStock, 10) : 10;
+  const isFullBundle = bundleData ? selectedBundleItems.length === bundleData.items.length : false;
 
   return (
     <>
@@ -342,7 +297,7 @@ const allImages = [product?.image, ...(product?.images || [])].filter(Boolean);
               {/* Price */}
               <HStack spacing={4} align="baseline" flexWrap="wrap">
                 <Text fontSize={{ base: "4xl", md: "5xl" }} fontWeight="bold" color={priceColor}>
-                  ${product.price}
+                  ${displayPrice || product.price || 0}
                 </Text>
 
                 {/* Show original price and discount only if data exists */}
@@ -389,6 +344,37 @@ const allImages = [product?.image, ...(product?.images || [])].filter(Boolean);
               </Box>
 
               <Divider />
+
+              {/* Variant Selector — shown only for products with variants */}
+              {product.hasVariants && product.variants?.length > 0 && (
+                <Box>
+                  <Text fontWeight="semibold" mb={2}>Options</Text>
+                  <HStack spacing={4} flexWrap="wrap">
+                    <Select
+                      placeholder="Select size"
+                      value={selectedSize}
+                      onChange={(e) => setSelectedSize(e.target.value)}
+                      maxW="200px"
+                      aria-label="Select size"
+                    >
+                      {[...new Set(product.variants.map((v) => v.size))].map((s) => (
+                        <option key={s} value={s}>{s}</option>
+                      ))}
+                    </Select>
+                    <Select
+                      placeholder="Select color"
+                      value={selectedColor}
+                      onChange={(e) => setSelectedColor(e.target.value)}
+                      maxW="200px"
+                      aria-label="Select color"
+                    >
+                      {[...new Set(product.variants.map((v) => v.color))].map((c) => (
+                        <option key={c} value={c}>{c}</option>
+                      ))}
+                    </Select>
+                  </HStack>
+                </Box>
+              )}
 
               {/* Quantity Selector */}
               <Box>
@@ -548,7 +534,7 @@ const allImages = [product?.image, ...(product?.images || [])].filter(Boolean);
                 <Box>
                   <Text fontSize="sm" color={textColor}>
                     Bundle Total:{' '}
-                    <Text as="span" textDecoration="line-through" color="gray.400">
+                    <Text as="span" textDecoration={isFullBundle ? "line-through" : "none"} color="gray.400">
                       ${bundleData.bundleTotal}
                     </Text>
                   </Text>
@@ -598,20 +584,13 @@ const allImages = [product?.image, ...(product?.images || [])].filter(Boolean);
     </>
   );
 };
-
-// Feature Box Component
+// Small presentational card used in the product's features grid.
 const FeatureBox = ({ icon, title, desc, bg }) => {
   const textColor = useColorModeValue("gray.700", "gray.300");
+  const borderColor = useColorModeValue("gray.200", "gray.600");
 
   return (
-    <HStack
-      p={4}
-      bg={bg}
-      borderRadius="lg"
-      spacing={3}
-      border="1px solid"
-      borderColor={useColorModeValue("gray.200", "gray.600")}
-    >
+    <HStack p={4} bg={bg} borderRadius="lg" spacing={3} border="1px solid" borderColor={borderColor}>
       <Icon as={icon} boxSize={6} color="blue.500" />
       <Box>
         <Text fontWeight="bold" fontSize="sm">{title}</Text>

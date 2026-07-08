@@ -13,4 +13,8 @@ router.delete('/:reviewId', authMiddleware, deleteReview);
 // Only authenticated users can add reviews
 router.post('/', authMiddleware,sanitizeInput, addReview);
 
+router.post('/', authMiddleware, addReview);
+router.put('/:reviewId', authMiddleware, updateReview);
+router.delete('/:reviewId', authMiddleware, deleteReview);
+
 export default router;

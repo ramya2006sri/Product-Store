@@ -3,14 +3,22 @@ import passport from "../config/passport.js";
 import jwt from "jsonwebtoken";
 import sanitizeInput from "../middleware/sanitizeInput.js";
 
+import User from "../models/user.model.js";
 import {
   registerUser,
   loginUser,
   logoutUser,
+  forgotPassword,
+  resetPassword,
 } from "../controllers/auth.controller.js";
+import {
+  setupTwoFactor,
+  verifyTwoFactorSetup,
+  disableTwoFactor,
+} from "../controllers/twoFactor.controller.js";
 
 import authMiddleware from "../middleware/authMiddleware.js";
-import { loginLimiter, logoutLimiter, registerLimiter } from "../middleware/rateLimiter.js";
+import { loginLimiter, logoutLimiter, registerLimiter, forgotPasswordLimiter, resetPasswordLimiter } from "../middleware/rateLimiter.js";
 
 const router = express.Router();
 
@@ -19,6 +27,15 @@ router.post("/register",registerLimiter,sanitizeInput, registerUser);
 router.post("/login",loginLimiter, loginUser);
 
 router.post("/logout", logoutLimiter, authMiddleware,logoutUser);
+
+router.post("/forgot-password", forgotPasswordLimiter, forgotPassword);
+router.post("/reset-password/:token", resetPasswordLimiter, resetPassword);
+
+// Two-factor authentication (TOTP / authenticator app). All require a logged-in
+// session; the login route itself enforces the code once 2FA is enabled.
+router.post("/2fa/setup", authMiddleware, setupTwoFactor);
+router.post("/2fa/verify", authMiddleware, verifyTwoFactorSetup);
+router.post("/2fa/disable", authMiddleware, disableTwoFactor);
 
 
 // Social OAuth Routes
@@ -37,10 +54,34 @@ router.get('/github/callback', passport.authenticate('github', { session: false,
 });
 
 router.get('/me', authMiddleware, async (req, res) => {
-    res.json({
-        success: true,
-        data: { id: req.user._id, name: req.user.name, email: req.user.email, avatar: req.user.avatar, provider: req.user.provider }
-    });
+    try {
+        const user = await User.findById(req.user.id).select('-password');
+
+        if (!user) {
+            return res.status(404).json({
+                success: false,
+                message: 'User not found'
+            });
+        }
+
+        res.json({
+            success: true,
+            data: {
+                id: user._id,
+                name: user.name,
+                email: user.email,
+                avatar: user.avatar,
+                provider: user.provider,
+                themePreference: user.themePreference
+            }
+        });
+    } catch (error) {
+        console.error('GET ME ERROR:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Server error'
+        });
+    }
 });
 
 export default router;

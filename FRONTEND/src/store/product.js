@@ -3,6 +3,13 @@ import { persist } from "zustand/middleware";
 
 const API = (import.meta.env.VITE_API_URL || "").replace(/\/$/, "");
 
+// Merge two product lists, dropping any incoming items already present (by _id).
+// Used by infinite scroll so appending the next page never duplicates a card.
+const mergeUnique = (existing, incoming) => {
+  const seen = new Set(existing.map((p) => p._id));
+  return [...existing, ...incoming.filter((p) => !seen.has(p._id))];
+};
+
 export const useRecentlyViewed = create(
   persist(
     (set) => ({
@@ -19,6 +26,13 @@ export const useRecentlyViewed = create(
 
 export const useProductStore = create((set) =>({
     products: [],
+    productCache: {},
+    // Infinite-scroll catalog state — lets HomePage restore the accumulated
+    // list (and its page) when the user navigates away and back.
+    catalogKey: null,
+    catalogPage: 1,
+    catalogTotalPages: 1,
+    catalogTotalProducts: 0,
     isLoading: false,
     isSubmitting: false,
     isDeleting: false,
@@ -76,12 +90,61 @@ export const useProductStore = create((set) =>({
         }
     },
 
-    fetchProducts: async (page = 1, limit = 10, sort = "", category = "") => {
-        set({ isLoading: true, error: null });
+    fetchProducts: async (options = {}) => {
+        const {
+            page = 1,
+            limit = 10,
+            sort = "",
+            category = "",
+            minPrice,
+            maxPrice,
+            brand,
+            minRating,
+            inStock,
+            // When true the fetched page is appended to the existing list
+            // (infinite scroll) instead of replacing it. listKey identifies the
+            // current sort+filter combination so HomePage can restore it later.
+            append = false,
+            listKey = null,
+        } = options;
+        const cacheKey = JSON.stringify({
+            page,
+            limit,
+            sort,
+            category,
+            minPrice,
+            maxPrice,
+            brand,
+            minRating,
+            inStock,
+        });
+
+        const cached = useProductStore.getState().productCache[cacheKey];
+
+        if (cached && Date.now() - cached.timestamp < 30000) {
+            set((state) => ({
+                products: append ? mergeUnique(state.products, cached.products) : cached.products,
+                isLoading: false,
+                error: null,
+                catalogKey: listKey ?? state.catalogKey,
+                catalogPage: cached.response.currentPage,
+                catalogTotalPages: cached.response.totalPages,
+                catalogTotalProducts: cached.response.totalProducts,
+            }));
+
+            return cached.response;
+        }
+        if (!append) set({ isLoading: true, error: null });
         try {
             let url = `${API}/api/products?page=${page}&limit=${limit}`;
             if (sort) url += `&sort=${sort}`;
             if (category) url += `&category=${encodeURIComponent(category)}`;
+            if (minPrice !== undefined && minPrice !== null) url += `&minPrice=${minPrice}`;
+            if (maxPrice !== undefined && maxPrice !== null) url += `&maxPrice=${maxPrice}`;
+            if (brand) url += `&brand=${encodeURIComponent(brand)}`;
+            if (minRating !== undefined && minRating !== null) url += `&minRating=${minRating}`;
+            if (inStock) url += `&inStock=true`;
+
             const res = await fetch(url);
             if (!res.ok) {
                 const errorData = await res.json().catch(() => ({}));
@@ -90,7 +153,28 @@ export const useProductStore = create((set) =>({
                 return { success: false, message: errorData.message || "Failed to fetch products" };
             }
             const data = await res.json();
-            set({ products: data.data, isLoading: false });
+            set((state) => ({
+                products: append ? mergeUnique(state.products, data.data) : data.data,
+                isLoading: false,
+                catalogKey: listKey ?? state.catalogKey,
+                catalogPage: data.currentPage,
+                catalogTotalPages: data.totalPages,
+                catalogTotalProducts: data.totalProducts,
+                productCache: {
+                    ...state.productCache,
+                    [cacheKey]: {
+                        timestamp: Date.now(),
+                        products: data.data,
+                        response: {
+                            success: true,
+                            currentPage: data.currentPage,
+                            totalPages: data.totalPages,
+                            totalProducts: data.totalProducts,
+                            limit: data.limit,
+                        },
+                    },
+                },
+            }));
             return {
                 success: true,
                 currentPage: data.currentPage,
@@ -122,14 +206,22 @@ export const useProductStore = create((set) =>({
         try {
             const res = await fetch(`${API}/api/products/${pid}`, {
                 method: "DELETE",
-            });
-            const data = await res.json();
+        });
+
+        if (!res.ok) {
+            set({ isDeleting: false });
+            return {
+                success: false,
+                message: `Request failed with status ${res.status}`,
+            };
+        }
+        const data = await res.json();
             if (!data.success) {
                 set({ isDeleting: false });
                 return { success: false, message: data.message };
             }
 
-            set(state => ({ products: state.products.filter(product => product._id !== pid), isDeleting: false }));
+            set(state => ({ products: state.products.filter(product => product._id !== pid), productCache: {}, isDeleting: false }));
             return { success: true, message: data.message };
         } catch (error) {
             console.error("Network error deleting product:", error);
@@ -160,8 +252,16 @@ export const useProductStore = create((set) =>({
 
             const res = await fetch(`${API}/api/products/${pid}`, {
                 method: "PUT",
-                body: formData,
+                 body: formData,
             });
+
+            if (!res.ok) {
+                set({ isSubmitting: false });
+                return {
+                    success: false,
+                    message: `Request failed with status ${res.status}`,
+                };
+            }
 
             const data = await res.json();
             if (!data.success) {
@@ -171,6 +271,7 @@ export const useProductStore = create((set) =>({
 
             set(state => ({
                 products: state.products.map(product => product._id === pid ? data.data : product),
+                productCache: {},
                 isSubmitting: false
             }));
             return { success: true, message: data.message };
@@ -180,10 +281,37 @@ export const useProductStore = create((set) =>({
             return { success: false, message: "Network error - could not reach API" };
         }
     },
+
+    restockProduct: async (pid, amount) => {
+        set({ isSubmitting: true, error: null });
+        try {
+            const res = await fetch(`${API}/api/products/${pid}/restock`, {
+                method: "PATCH",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ amount }),
+            });
+            const data = await res.json();
+            if (!data.success) {
+                set({ isSubmitting: false, error: data.message });
+                return { success: false, message: data.message };
+            }
+            set((state) => ({
+                products: state.products.map((p) => p._id === pid ? data.data : p),
+                productCache: {},
+                isSubmitting: false,
+            }));
+            return { success: true, data: data.data };
+        } catch (error) {
+            console.error("Network error restocking product:", error);
+            set({ isSubmitting: false, error: "Network error - could not reach API" });
+            return { success: false, message: "Network error - could not reach API" };
+        }
+    },
+
 compareList: [],
     addToCompare: (product) => set((state) => {
       if (state.compareList.find((p) => p._id === product._id)) return state;
-      if (state.compareList.length >= 2) return state;
+      if (state.compareList.length >= 4) return state;
       return { compareList: [...state.compareList, product] };
     }),
     removeFromCompare: (pid) => set((state) => ({

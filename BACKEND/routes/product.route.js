@@ -3,6 +3,10 @@ import upload, { handleUploadError } from "../middleware/upload.js";
 import sanitizeInput from "../middleware/sanitizeInput.js";
 import { createProduct, deleteProduct, getProducts, getProductCategories, updateProduct, getProductById, getRelatedProducts, searchProducts, getProductBundle } from "../controllers/product.controller.js";
 import reviewRoutes from './review.route.js';  // ← YEH LINE ADD KARO
+import { createProduct, deleteProduct, getProducts, getProductCategories, updateProduct, getProductById, getRelatedProducts, searchProducts, getProductBundle, restockProduct } from "../controllers/product.controller.js";
+import reviewRoutes from './review.route.js';
+import authMiddleware from "../middleware/authMiddleware.js";
+import adminMiddleware from "../middleware/adminMiddleware.js";
 
 const router = express.Router();
 
@@ -16,6 +20,10 @@ router.post("/", upload.single("image"), handleUploadError, sanitizeInput, creat
 router.put("/:id", upload.single("image"), handleUploadError, sanitizeInput, updateProduct);
 router.delete("/:id", deleteProduct);
 
+router.post("/", authMiddleware, adminMiddleware, upload.single("image"), handleUploadError, createProduct);
+router.put("/:id", authMiddleware, adminMiddleware, upload.single("image"), handleUploadError, updateProduct);
+router.patch("/:id/restock", authMiddleware, adminMiddleware, restockProduct);
+router.delete("/:id", authMiddleware, adminMiddleware, deleteProduct);
 
 router.use('/:productId/reviews', reviewRoutes);
 

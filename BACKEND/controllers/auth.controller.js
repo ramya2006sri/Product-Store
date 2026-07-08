@@ -1,11 +1,19 @@
+import crypto from "crypto";
 import User from "../models/user.model.js";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
+import { sendPasswordResetEmail } from "../services/email.service.js";
+import { processReferralOnRegister } from "../services/referral.service.js";
+import { verifyTOTP } from "../services/totp.service.js";
+
+const normalizeEmail = (email) => email?.trim().toLowerCase();
 
 export const registerUser = async (req, res) => {
   try {
     
-    const { name, email, password } = req.body;
+    const { name, email, password, referralCode } = req.body;
+
+    const normalizedEmail = normalizeEmail(email);
 
     if (!name || !email || !password) {
       return res.status(400).json({
@@ -14,7 +22,7 @@ export const registerUser = async (req, res) => {
       });
     }
 
-    const existingUser = await User.findOne({ email });
+    const existingUser = await User.findOne({ email: normalizedEmail });
 
     if (existingUser) {
       return res.status(409).json({
@@ -27,7 +35,7 @@ export const registerUser = async (req, res) => {
 
     const user = await User.create({
       name,
-      email,
+      email: normalizedEmail,
       password: hashedPassword,
     });
 
@@ -40,6 +48,13 @@ export const registerUser = async (req, res) => {
         email: user.email,
       },
     });
+
+    // Process referral asynchronously so it doesn't block response
+    if (referralCode) {
+      processReferralOnRegister(referralCode, user).catch(err => {
+        console.error("Referral Error:", err);
+      });
+    }
   } catch (error) {
     res.status(500).json({
       success: false,
@@ -50,7 +65,7 @@ export const registerUser = async (req, res) => {
 
 export const loginUser = async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email, password, token: twoFactorToken } = req.body;
 
     if (!email || !password) {
       return res.status(400).json({
@@ -59,7 +74,10 @@ export const loginUser = async (req, res) => {
       });
     }
 
-    const user = await User.findOne({ email });
+    const normalizedEmail = normalizeEmail(email);
+
+    // twoFactorSecret is select:false, so it must be requested explicitly.
+    const user = await User.findOne({ email: normalizedEmail }).select("+twoFactorSecret");
 
     if (!user) {
       return res.status(401).json({
@@ -93,6 +111,25 @@ export const loginUser = async (req, res) => {
       });
     }
 
+    // When 2FA is enabled, a valid authenticator code is required in addition
+    // to the password. If no code was supplied, signal the client to prompt for
+    // one rather than issuing a session token.
+    if (user.twoFactorEnabled) {
+      if (!twoFactorToken) {
+        return res.status(200).json({
+          success: true,
+          twoFactorRequired: true,
+          message: "Two-factor authentication code required",
+        });
+      }
+      if (!verifyTOTP(twoFactorToken, user.twoFactorSecret)) {
+        return res.status(401).json({
+          success: false,
+          message: "Invalid two-factor authentication code",
+        });
+      }
+    }
+
     const token = jwt.sign(
       {
         id: user._id,
@@ -111,6 +148,7 @@ export const loginUser = async (req, res) => {
         id: user._id,
         name: user.name,
         email: user.email,
+        role: user.role,
       },
     });
   } catch (error) {
@@ -132,5 +170,86 @@ export const logoutUser = async (req, res) => {
       success: false,
       message: error.message,
     });
+  }
+};
+
+const SAFE_RESET_RESPONSE = { success: true, message: "If that email exists, a reset link has been sent." };
+
+export const forgotPassword = async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) {
+      return res.status(400).json({ success: false, message: "Email is required" });
+    }
+
+    const normalizedEmail = normalizeEmail(email)
+
+    const user = await User.findOne({ email: normalizedEmail });
+
+    // Artificial delay on early-return paths so response time doesn't reveal user existence
+    if (!user || user.provider !== 'local') {
+      await new Promise(r => setTimeout(r, 250));
+      return res.status(200).json(SAFE_RESET_RESPONSE);
+    }
+
+    const rawToken = crypto.randomBytes(32).toString('hex');
+    const hashedToken = crypto.createHash('sha256').update(rawToken).digest('hex');
+    const tokenExpiry = new Date(Date.now() + 60 * 60 * 1000);
+
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+    const resetUrl = `${frontendUrl}/reset-password/${rawToken}`;
+
+    // Send email BEFORE persisting token — prevents orphaned tokens if email fails
+    try {
+      await sendPasswordResetEmail(user.email, resetUrl);
+    } catch (emailErr) {
+      console.error('[Email] Password reset send failed:', emailErr.message);
+      return res.status(500).json({ success: false, message: "Failed to send reset email. Please try again later." });
+    }
+
+    user.resetPasswordToken = hashedToken;
+    user.resetPasswordExpires = tokenExpiry;
+    await user.save();
+
+    res.status(200).json(SAFE_RESET_RESPONSE);
+  } catch (error) {
+    console.error('[ForgotPassword] Unexpected error:', error.message);
+    res.status(500).json({ success: false, message: "An unexpected error occurred. Please try again." });
+  }
+};
+
+export const resetPassword = async (req, res) => {
+  try {
+    const { token } = req.params;
+    const { password } = req.body;
+
+    if (!token || !password) {
+      return res.status(400).json({ success: false, message: "Token and new password are required" });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({ success: false, message: "Password must be at least 6 characters" });
+    }
+
+    const hashedToken = crypto.createHash('sha256').update(token).digest('hex');
+
+    const user = await User.findOne({
+      resetPasswordToken: hashedToken,
+      resetPasswordExpires: { $gt: new Date() },
+    });
+
+    if (!user) {
+      return res.status(400).json({ success: false, message: "Reset link is invalid or has expired" });
+    }
+
+    user.password = await bcrypt.hash(password, 10);
+    user.resetPasswordToken = null;
+    user.resetPasswordExpires = null;
+    await user.save();
+
+    res.status(200).json({ success: true, message: "Password updated successfully. You can now log in." });
+  } catch (error) {
+    console.error('[ResetPassword] Unexpected error:', error.message);
+    res.status(500).json({ success: false, message: "An unexpected error occurred. Please try again." });
   }
 };
